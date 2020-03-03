@@ -1,0 +1,305 @@
+---
+title: "Differential gene expression analysis"
+output:
+  word_document: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The aim of this task is to determine, which genes are differentially regulated based on treatment exposure.
+
+**Data files for the analysis:**
+
+1)	Covariates file (n = 60 individuals), including sex, age, body-mass index (bmi), treatment, batch effects, and sex. 
+Batch effects occur because measurements are affected by laboratory conditions, reagent lots, and personnel differences. This becomes a major problem when batch effects are confounded with an outcome of interest and lead to incorrect conclusions. 
+In our data batches are codes as:
+batch 1 = chip (n=10) 
+batch2 = plate column (n=12)
+batch 3 = plate (n=2, a plate has 96 positions 12 columns and 8 rows. Rows are equal to chip)
+
+2)	Gene expression files (n = 47298 features array probes of the Illumina Human HT-12v4 Bead Chip, 120 samples (60 individuals at baseline (treatment=0) and after treatment (=1))). 
+
+Before we start, the working directory should be set, libraries necessary for data analysis and manipulation attached, data files loaded:
+
+
+```{r loadlib, echo=T, results='hide', message=F, warning=F}
+rm(list=ls())
+setwd("C:/Users/SVITLANA/Desktop/PhD Application/Assignment")
+
+library(beadarray)
+library(limma)
+library (MASS)
+
+load("expression_data.rda")
+pheno_data <- read.table("pheno_dat.txt")
+colnames(pheno_data) <- sapply(pheno_data[1,], as.character)
+pheno_data <- pheno_data[-1,]
+
+```
+
+## Assignment
+
+
+_Step 1_: Apply a quality control (QC) on the gene expression data including:
+a)	filtering by a detection p-value (0.05 in 50% of the samples)
+b)	normalization 
+c)	batch correction 
+
+_Step 2_: Apply QC on the phenotype data (covariates) including outlier filtering.
+
+_Step 3_: How many significantly differently regulated genes do you find and how many array probes do they comprise?
+
+_Step 4_: How many of the detected genes (from Step 2) have a fold change $\geq$ 1.2?
+
+## Solution
+
+**Step 1 (a)**
+
+Filtering non-responding probes from further analysis can improve the power to
+detect differential expression. One way of achieving this is to remove probes whose probe sequence has undesirable properties. 
+
+Since the detection p-values are already available within the "expression_data.rda" file (which is stored as BSData) in the "assayData" object, we may use them to perform filtering procedure. 
+
+For every probe, we check how many samples are statistically signifficant by selecting only those detection values which are smaller than 0.05. If the amount of signifficant samples is smaller than half of the number of samples, the probe is filtered out of the data.
+
+```{r }
+
+assay.Data <- attr(BSData,"assayData")
+
+filt <- apply(assay.Data$Detection < 0.05, 1, sum) >=  dim(assay.Data$Detection)[2]*0.5
+
+BSData.filt <- BSData[filt,]
+
+```
+
+After filtering procedure, the number of probes decreased from 47298 to 15711: 
+
+```{r }
+dim(BSData)
+dim(BSData.filt)
+```
+
+
+**Step 1 (b)**
+
+To correct for differences in expression level across a chip and between chips we
+need to normalise the signal to make the arrays comparable.
+
+The scanner generally produces values for the probe-specific average intensities in the range 0 to 2^16 - 1, although the image manipulation and background subtraction steps can lead to values outside this range. This is not a convenient scale for visualization and analysis and it is common to convert intensities onto the approximate range 0 to 16 using a log$_2$ transformation.
+
+We apply quantile normalization method to the log$_2$-transformed data using the _normaliseIllumina_ function from _beadarray_ package.
+
+```{r }
+BSData.norm <- normaliseIllumina(BSData.filt, method="quantile", transform="log2")
+```
+
+
+**Step 1 (c)**
+
+Firstly, we have to to merge expression data with phenotype data:
+
+```{r }
+temp <- merge(pData(BSData.norm), 
+              pheno_data, by.x = "sampleID", by.y = "ID")
+pData(BSData.norm) <- temp
+
+```
+
+Secondly, the phenotype (covariates) data has missing values. Since there is only one individual with missing information about batch effects, age, sex, treatment and BMI, we can remove this individual from the data-set.
+
+```{r }
+missing <- apply(is.na(pData(BSData.norm)),1,sum) > 0
+
+pData(BSData.norm)[which(missing),"individual_ID"]
+
+BSData.norm.clean <- BSData.norm[,!missing]    
+
+```
+
+Now, we need to repeat filtering for cleaned data:
+
+```{r }
+assay.Data.clean <- attr(BSData.norm.clean,"assayData")
+filt.clean <- apply(assay.Data.clean$Detection < 0.05, 1, sum) >=  dim(assay.Data.clean$Detection)[2]*0.5
+BSData.filt.clean <- BSData.norm.clean[filt.clean,]
+```
+
+The number of probes slightly decreased when we removed the observation with missing values:
+
+```{r }
+dim(BSData.norm.clean)
+dim(BSData.filt.clean)
+```
+
+Next, we remove batch effects from intensities sobsequently for every batch: 
+
+```{r echo=T, results='hide', message=F, warning=F}
+assay.Data.filt.clean <- attr(BSData.filt.clean,"assayData")
+assay.Data.filt.clean.batch1Corrected <- removeBatchEffect(assay.Data.filt.clean$exprs, 
+                                          batch = BSData.filt.clean$batch1)
+assay.Data.filt.clean.batch12Corrected <- 
+  removeBatchEffect(assay.Data.filt.clean.batch1Corrected, 
+                    batch = BSData.filt.clean$batch2)
+
+assay.Data.filt.clean.batch123Corrected <- 
+  removeBatchEffect(assay.Data.filt.clean.batch12Corrected, 
+                    batch = BSData.filt.clean$batch3)
+
+assay.Data.corrected <- assay.Data.filt.clean.batch123Corrected 
+
+```
+
+```{r }
+assay.Data.filt.clean$exprs[1:5,1:5]
+assay.Data.corrected[1:5,1:5]
+```
+
+**Step 2**
+
+There various techniques how to perform model diagnostics and identify outliers. The unusual values which do not follow the norm are called an outlier. Outliers present a particular challenge for analysis, and thus it becomes essential to identify these values and tackle them.
+
+We are interested if there are any outlier values among covariates. As only _age_ and _bmi_ are continuous variables, there is no point of analysing other predictor variables for outliers. Prepare the variables of interest:
+
+```{r }
+treatment <- BSData.filt.clean$treatment
+sex <- BSData.filt.clean$sex
+age <- BSData.filt.clean$age
+bmi <- BSData.filt.clean$bmi
+
+age_num <- as.numeric(as.character(age))
+sex_num <- as.numeric(as.character(sex))
+treatment_num <- as.numeric(as.character(treatment))
+bmi_num <- as.numeric(as.character(bmi))
+```
+
+
+Leverage is a measure of how far away the independent variable values of an observation are from those of the other observations. This metric is related to covariates only and does not comprise for possible association with outcome variable. 
+```{r }
+X <- as.matrix(data.frame(age_num, bmi_num))
+
+Xt <- t(X)
+W <- Xt %*% X
+det(W)!=0
+```
+
+Hence, inverse matrix exists and therefore we may compute the hat matrix:
+
+```{r }
+W_inv <- ginv(W)
+H <- X %*% W_inv %*% Xt
+leverage <- ifelse(diag(H)>4/118,"high","not high")
+```
+
+If we take the first probe array and age as an example, the leverage works as follows:
+
+```{r echo=FALSE}
+data.temp <- data.frame(age_num, bmi_num,exps1 = as.numeric(t(assay.Data.corrected[1,])))
+
+ggplot(data = data.temp, aes(x=age_num, y=exps1,color=leverage)) +
+  geom_point() +
+  geom_smooth(data=data.temp,aes(x=age_num, y=exps1),
+   method = "lm",inherit.aes = FALSE)
+```
+
+How, we have to remove outlires taking out the intensities for samples with high leverage:
+
+```{r }
+outlier <- leverage == "high"
+
+BSData.final <- BSData.filt.clean[,!outlier]
+pData(BSData.final)[,-10]
+
+## remove outliers from assayData:
+assay.Data.corrected.final <- assay.Data.corrected[,!outlier]
+dim(assay.Data.corrected.final)
+```
+
+We may also try to performthe analysis of resuduals to check for outliers. However, this approach requires the specific assumptions to be satisfied: 
+residuals are independent and approximately normally distributed with zero mean and a constant variance. 
+
+Let us assume that these assumptions are true. Then, we may caclulate residuals of the linear model for every probe taking expressions (intensities) as a dependent variable and sex, age, body mass index and treatment as covariates. Furthermore, we use the rule of 3-sigma to identify outliers, i.e. samples which are located too far from the mean. 
+
+
+```{r }
+intensity.trans <- t(assay.Data.corrected)
+
+n.probes <- dim(intensity.trans)[2]
+n.samples <- dim(intensity.trans)[1]
+
+temp.mat <- matrix(0, nrow = n.samples, ncol = n.probes)
+for (k in 1:n.probes){
+  linear.model.fit <- lm(formula = intensity.trans[,k] ~ 
+                           treatment_num + sex_num + age_num + bmi_num)
+  linear.model.resid <- linear.model.fit$residuals
+  resid.mean <- mean(linear.model.resid)
+  resid.sd <- sd(linear.model.resid)
+  temp.mat[,k] <- abs(linear.model.resid - resid.mean)/resid.sd > 3
+  
+}
+
+outlier.resid <- apply(temp.mat, 1, sum)/n.probes > 0.05
+
+BSData.final.resid <- BSData.filt.clean[,!outlier.resid]
+pData(BSData.final.resid)[,-10]
+```
+
+As we may see from the phenotype data, the individual with age and BMI of 200 was not removed. Thus, we would stay with the leverage method for outlier filtering.
+
+
+**Step 3**
+
+The differential expression methods available in the _limma_ package can be used
+to identify differentially expressed genes. The functions _lmFit_ and _eBayes_ can
+be applied to the normalised data. Firstly, we set up a design matrix for the  experiment and fit a linear model to summaries the data
+from the UHRR and Brain replicates to give one value per condition. 
+
+Secondly, we compte empirical array quality weights which are used to measure the relative reliability of each array. A variance is estimated for each array by the _arrayWeights_ function which measures how well the expression values from each array follow the linear model. These variances are converted to relative weights which can then be employed in the linear model to down-weight observations from less reliable arrays which improves power to detect differential expression. 
+
+Given these weights and design matrix, we fit a linear model to intensities (matrix of expression values after batch coorection procedure).
+
+Last, we define contrasts comparing the baseline sample to the after treatment and calculate moderated _t_-statistics with empirical Bayes shrinkage of the sample variances.
+
+```{r }
+rna <- factor(pData(BSData.final)[,"treatment"])
+design <- model.matrix(~0+rna)
+colnames(design) <- c("Before", "After")
+aw <- arrayWeights(assay.Data.corrected.final, design)
+fit <- lmFit(assay.Data.corrected.final, design, weights=aw)
+contrasts <- makeContrasts(Before-After, levels=design)
+contr.fit <- eBayes(contrasts.fit(fit, contrasts))
+topTable(contr.fit, coef=1)
+```
+
+In order to quantify the amount of significantly differently regulated genes, we need retrieve the list of genes from features data. 
+
+```{r }
+D <- data.frame(fData(BSData.final), pval = contr.fit$p.value )
+D <- D[,c("ProbeID", "SYMBOL", "Before...After")]
+names(D) <- c("ProbeID", "SYMBOL", "pval")
+sum(D$pval < 0.05) 
+signif.Genes <- D[D$pval < 0.05,]
+length(unique(signif.Genes$SYMBOL)) 
+```
+
+Therefore, we have 307 significantly differently regulated genes when the number of array probes that these genes comprise is 335. 
+
+
+**Step 4**
+
+Next, we estimate the fold-change of a gene measured by a probe based on the quantile-normalized data. Since _lmFit_ form _limma_ package provides us with fold change vaules and assumes that they are already log-transformed, the log-fold change is just:
+
+```{r }
+genes <- fData(BSData.final)[,"SYMBOL"]
+topTable(contr.fit, coef=1, number=10000, genelist=genes, 
+         adjust.method="none", p.value=0.05, lfc=log2(1.2))
+```
+
+Therefore, there are no significantly differently regulated genes which have a fold change $\geq$ 1.2. 
+
+
+
